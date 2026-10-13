@@ -134,6 +134,32 @@ fn opening_a_pdf_shows_comments_and_bookmarks() {
     h.get_by_label("Beta section");
 }
 
+/// #1590: side panes the user closed stay closed when PdfCraft restarts and opens another PDF,
+/// even one with comments and bookmarks, which would otherwise open on the Comments panel.
+#[test]
+fn closed_side_panes_stay_closed_after_a_restart_and_opening_a_pdf() {
+    use pdfcraft_ui_egui::RightPanel;
+    let mut h = harness(|app| app.open_bytes("fixture.pdf", None, FIXTURE.to_vec()).expect("fixture opens"));
+    assert_eq!(h.state().right, Some(RightPanel::Comments));
+    assert!(h.state().left_open);
+    h.state_mut().choose_right_panel(None);
+    h.state_mut().set_option("left", "closed").unwrap();
+    h.run_steps(3);
+    let saved = h.state().persist();
+    let mut h = harness(move |app| {
+        app.restore(&saved);
+        app.open_bytes("fixture.pdf", None, FIXTURE.to_vec()).expect("fixture opens");
+    });
+    assert_eq!(h.state().right, None, "the closed right pane reopened");
+    assert!(!h.state().left_open, "the closed left pane reopened");
+    assert!(h.query_by_label_contains("Check the numbers").is_none());
+    // Within a session too: another document opens with them closed.
+    h.state_mut().open_bytes("again.pdf", None, FIXTURE.to_vec()).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().right, None);
+    assert!(!h.state().left_open);
+}
+
 /// Read mode hides the tools, not the navigation panes: the rail's Bookmarks button opens the
 /// bookmarks when Read is the default workspace (#932), and the left tool pane stays hidden.
 #[test]
@@ -854,6 +880,42 @@ fn preferences_selects_default_workspace_for_next_open() {
     h.run_steps(2);
     h.state_mut().open_bytes("fixture.pdf", None, FIXTURE.to_vec()).unwrap();
     assert_eq!(h.state().mode, Mode::Read);
+}
+
+/// Preferences ▸ Animation effects: the system's animation setting until the user chooses On or
+/// Off. The choice is saved, and settings holding anything else leave it alone.
+#[test]
+fn preferences_choose_animation_effects_and_the_choice_is_saved() {
+    use egui::accesskit::Role;
+    use pdfcraft_ui_egui::motion::AnimationEffects;
+    let mut h = harness(|app| app.set_option("dialog", "preferences").unwrap());
+    assert_eq!(h.state().animation_effects, AnimationEffects::System);
+    h.get_by_label("Animation effects");
+    for (label, choice) in [
+        ("Off", AnimationEffects::Off),
+        ("On", AnimationEffects::On),
+        ("Use system setting", AnimationEffects::System),
+        ("Off", AnimationEffects::Off),
+    ] {
+        h.get_by_role_and_label(Role::RadioButton, label).scroll_to_me();
+        h.run_steps(4);
+        h.get_by_role_and_label(Role::RadioButton, label).click();
+        h.run_steps(2);
+        assert_eq!(h.state().animation_effects, choice, "{label}");
+    }
+    let saved = h.state().persist();
+    assert!(saved.contains(r#""animation_effects":"off""#), "{saved}");
+    let mut restored = PdfCraftApp::new();
+    restored.restore(&saved);
+    assert_eq!(restored.animation_effects, AnimationEffects::Off);
+    let mut fresh = PdfCraftApp::new();
+    fresh.restore(&saved.replace(r#""animation_effects":"off""#, r#""animation_effects":"sideways""#));
+    assert_eq!(fresh.animation_effects, AnimationEffects::System);
+    // The control channel and the command line take the same three names.
+    fresh.set_option("animation_effects", "ON").unwrap();
+    assert_eq!(fresh.animation_effects, AnimationEffects::On);
+    assert!(fresh.set_option("animation_effects", "sideways").unwrap_err().contains("system, on, or off"));
+    assert_eq!(fresh.animation_effects, AnimationEffects::On);
 }
 
 #[test]

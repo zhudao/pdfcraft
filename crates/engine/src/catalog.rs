@@ -457,11 +457,12 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         sections: &[ToolSection {
             title: "Accessibility",
             items: &[
-                item("Automatically tag PDF", "tag", "a11y.autotag", Planned("M12")),
+                item("Automatically tag PDF", "tag", "a11y.autotag", Ready),
                 item("Change reading options", "book-open", "a11y.reading_options", Ready),
                 item("Check for accessibility", "accessibility", "a11y.check", Ready),
                 item("Open accessibility report", "file-text", "a11y.report", Ready),
                 item("Add alternate text", "image", "a11y.alt_text", Ready),
+                item("Tags panel", "tag", "a11y.tags", Ready),
                 item("Fix reading order", "list-ordered", "a11y.reading_order", Planned("M12")),
             ],
         }],

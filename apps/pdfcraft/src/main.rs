@@ -33,6 +33,8 @@ use pdfcraft_ui_egui::PdfCraftApp;
 mod apple_events;
 mod compositor_gpu;
 mod logging;
+#[cfg(target_os = "windows")]
+mod motion;
 mod reopen;
 mod single_instance;
 mod text_scale;
@@ -124,6 +126,35 @@ fn path_from_arg(arg: String) -> String {
     String::from_utf8(out).unwrap_or(arg)
 }
 
+/// Some programs start the PDF reader with the path unquoted (`pdfcraft.exe P:\Docs\01 Contract.PDF`),
+/// so a path with spaces arrives split into several arguments (Acrobat accepts this). When an
+/// argument names no file but it and the ones after it, joined with one space, do, rejoin them
+/// (the longest such run). Anything else is kept as given. Runs of several spaces can't be recovered: the split has lost them.
+fn rejoin_split_paths(args: Vec<String>, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while let Some(first) = args.get(i) {
+        if exists(first) {
+            out.push(first.clone());
+            i += 1;
+            continue;
+        }
+        // The longest run starting here that names a file; capped so a long list stays cheap.
+        let end = (i + 2..=args.len().min(i + 32)).rev().find(|&j| args.get(i..j).is_some_and(|run| exists(&run.join(" "))));
+        match end.and_then(|j| Some((j, args.get(i..j)?.join(" ")))) {
+            Some((j, joined)) => {
+                out.push(joined);
+                i = j;
+            }
+            None => {
+                out.push(first.clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn main() -> eframe::Result {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
@@ -153,7 +184,7 @@ fn main() -> eframe::Result {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => {
-                println!("pdfcraft {}", env!("CARGO_PKG_VERSION"));
+                println!("pdfcraft {}", pdfcraft_engine::build_info::version());
                 return Ok(());
             }
             "--control" => control_file = args.next(),
@@ -166,6 +197,7 @@ fn main() -> eframe::Result {
             _ => files.push(path_from_arg(a)),
         }
     }
+    let files = rejoin_split_paths(files, |p| std::path::Path::new(p).is_file());
     let integrated = cfg!(target_os = "macos");
     migrate_legacy_folders();
     // The log file lives in the settings folder; opened after the arguments (so `--version` leaves
@@ -173,7 +205,7 @@ fn main() -> eframe::Result {
     // Records logged until now are written to it first.
     if let (Some(logger), Some(dir)) = (logger, settings_dir()) {
         match logger.attach_dir(&dir.join("logs")) {
-            Ok(path) => log::info!("PdfCraft {}, log file {}", env!("CARGO_PKG_VERSION"), path.display()),
+            Ok(path) => log::info!("PdfCraft {}, log file {}", pdfcraft_engine::build_info::version(), path.display()),
             // Standard error only by now (`attach_dir` gave up on the file); unlike `eprintln!`, never panics.
             Err(e) => log::warn!("no log file: {e}"),
         }
@@ -312,6 +344,12 @@ fn app_creator<'a>(
         }
         app.integrated_titlebar = integrated;
         app.system_text_scale = text_scale::system();
+        // Windows' Animation effects setting, which Preferences ▸ Animation effects follows unless
+        // it is set to On or Off.
+        #[cfg(target_os = "windows")]
+        {
+            app.motion.source = Some(motion::source());
+        }
         app.update_source = Some(std::sync::Arc::new(updates::latest_release));
         app.printer_source = Some(pdfcraft_ui_egui::system_printers());
         app.os_key_store_ids = cfg!(any(target_os = "macos", target_os = "windows"));
@@ -476,6 +514,11 @@ fn write_control_file(path: &str, port: u16, token: &str) -> std::io::Result<()>
 ///   its window appeared. D3D12 is the native, best-supported backend there.
 fn configure_gpu(native: &mut eframe::NativeOptions) {
     let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup else { return };
+    // Nothing draws or dispatches indirectly, so wgpu's check of indirect arguments only costs a
+    // compute shader when the device is created, one that Metal can't compile on an Intel Iris
+    // Pro: the device is lost and the window falls back to OpenGL. `WGPU_VALIDATION_INDIRECT_CALL=1`
+    // turns the check back on.
+    setup.instance_descriptor.flags = setup.instance_descriptor.flags.difference(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL).with_env();
     // egui-wgpu requests only 8192 pixels even when the adapter can render larger surfaces.
     // A restored 3440-point window at 250% DPI requests 8600 pixels and otherwise panics in
     // Surface::configure before the app starts. Keep the renderer's other device requirements,
@@ -672,6 +715,19 @@ mod tests {
         Ok(Endpoint { port: 4321, token: "0123456789abcdef".into() })
     }
 
+    /// Tests that open a real GPU device take this first, so only one of them is inside the
+    /// graphics libraries at a time. The test threads otherwise run them together, and on
+    /// FreeBSD's CI machine the test process then died with SIGSEGV, in about half the runs:
+    /// the first device was still being set up when the second test began its own. The UI
+    /// tests take turns the same way (`crates/ui-egui/tests/view.rs`). Hold it for the whole
+    /// test (declared before the instance, so it's released after the device is dropped).
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gpu() -> std::sync::MutexGuard<'static, ()> {
+        // A test that panicked while holding it leaves nothing to clean up.
+        GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn a_control_channel_that_cant_be_published_stops_the_app() {
         let dir = std::env::temp_dir().join(format!("pdfcraft-app-control-{}", std::process::id()));
@@ -704,6 +760,24 @@ mod tests {
         assert_eq!(super::path_from_arg("file:///tmp/a%2".to_string()), "/tmp/a%2");
         assert_eq!(super::path_from_arg("file:///tmp/%zz%".to_string()), "/tmp/%zz%");
         assert_eq!(super::path_from_arg("file:///tmp/%FF.pdf".to_string()), "file:///tmp/%FF.pdf");
+    }
+
+    #[test]
+    fn unquoted_paths_with_spaces_are_rejoined() {
+        let have = ["P:\\Archive\\00042A26 Contract.PDF", "C:\\a b c.pdf", "C:\\a.pdf", "C:\\x y.pdf"];
+        let exists = |p: &str| have.contains(&p);
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The case an office program produced: one path, split at its space.
+        assert_eq!(
+            super::rejoin_split_paths(args(&["P:\\Archive\\00042A26", "Contract.PDF"]), exists),
+            args(&["P:\\Archive\\00042A26 Contract.PDF"])
+        );
+        // The longest run wins; files that exist on their own are left alone.
+        assert_eq!(super::rejoin_split_paths(args(&["C:\\a", "b", "c.pdf", "C:\\a.pdf"]), exists), args(&["C:\\a b c.pdf", "C:\\a.pdf"]));
+        assert_eq!(super::rejoin_split_paths(args(&["C:\\a.pdf", "C:\\x", "y.pdf"]), exists), args(&["C:\\a.pdf", "C:\\x y.pdf"]));
+        // Nothing to join: kept as given, so the missing file is still reported by name.
+        assert_eq!(super::rejoin_split_paths(args(&["missing.pdf", "other"]), exists), args(&["missing.pdf", "other"]));
+        assert!(super::rejoin_split_paths(Vec::new(), exists).is_empty());
     }
 
     #[test]
@@ -759,6 +833,10 @@ mod tests {
         };
         if std::env::var_os("WGPU_POWER_PREF").is_none() {
             assert_eq!(setup.power_preference, eframe::wgpu::PowerPreference::LowPower);
+        }
+        if std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_none() {
+            let flags = setup.instance_descriptor.flags;
+            assert!(!flags.contains(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL), "Intel Metal can't compile its shader: {flags:?}");
         }
         if cfg!(target_os = "windows") && std::env::var_os("WGPU_BACKEND").is_none() {
             let backends = setup.instance_descriptor.backends;
@@ -878,6 +956,7 @@ mod tests {
         // and an error wgpu raises before anything reaches the driver: a texture one pixel wider
         // than the device allows.
         use eframe::wgpu;
+        let _gpu = gpu();
         let native = super::native_options(false, eframe::Renderer::Wgpu);
         let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &native.wgpu_options.wgpu_setup else {
             panic!("default setup creates its own instance")
@@ -944,6 +1023,7 @@ mod tests {
     #[test]
     fn pipeline_creation_error_is_returned_and_device_remains_usable() {
         use eframe::{egui_wgpu, wgpu};
+        let _gpu = gpu();
         let mut native = super::native_options(false, eframe::Renderer::Wgpu);
         let egui_wgpu::WgpuSetup::CreateNew(setup) = &native.wgpu_options.wgpu_setup else { panic!("default setup creates its own instance") };
         let instance = pollster::block_on(native.wgpu_options.wgpu_setup.new_instance());
